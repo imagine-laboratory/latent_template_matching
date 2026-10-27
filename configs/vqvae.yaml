@@ -1,0 +1,17 @@
+batch_size: 4                # Batch size for training
+lr: 0.0001                     # Learning rate
+epochs: 1                   # Number of training epochs
+patience: 15                # Early stopping patience
+checkpoints: "./checkpoints/vqvae/"  # Checkpoint save path
+train_ratio: 0.8            # Train ratio
+beta_kl_loss: 0.1           # Beta KL Loss (used in Optuna)
+device: "cuda"              # Device
+architecture: "cuda"        # Model architecture
+dataset: "/home/rtxmsi1/Downloads/VAE_training-master (2)/FULL_VERTICAL_PINEAPPLE/FULL_UNIFIED"  # Dataset path
+wandb_project: "vae_training_exp1"  # Wandb Project Name
+wandb_entity: "imagine-laboratory-conare"  # Wandb Project Entity
+
+codebook_dim: 64
+num_embeddings: 16
+commitment_cost: 0.25
+path_test_ids: "/home/rtxmsi1/Downloads/VAE_training-master (2)/test_ids_fold_1.txt"

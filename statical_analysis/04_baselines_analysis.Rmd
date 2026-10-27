@@ -1,0 +1,220 @@
+---
+title: "Held-out comparison against the baselines"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(jsonlite)
+})
+set.seed(42)
+```
+
+```{r constants}
+INK <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"
+GRID_C <- "#e1e0d9"; SURFACE <- "#ffffff"; ACCENT <- "#c1121f"
+FONT <- "URWPalladio"
+
+M    <- c("proposed", "grounding_dino", "yolo")
+MLAB <- c(proposed = "Proposed", grounding_dino = "Grounding DINO", yolo = "YOLOv8")
+MCOL <- c(proposed = "#A98280", grounding_dino = "#8BA3B8", yolo = "#C0B695")
+
+dir.create("figures", showWarnings = FALSE)
+
+theme_thesis <- function(base = 8.5) {
+  theme_minimal(base_size = base, base_family = FONT) +
+    theme(
+      text = element_text(colour = INK, family = FONT),
+      panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(colour = GRID_C, linewidth = 0.5 / .pt),
+      panel.border = element_blank(),
+      axis.line  = element_line(colour = MUTED, linewidth = 0.6 / .pt),
+      axis.ticks = element_line(colour = INK2,  linewidth = 0.6 / .pt),
+      axis.ticks.length = unit(1.5, "pt"),
+      axis.text  = element_text(colour = INK2, size = 6.3, family = FONT),
+      axis.title.x = element_text(colour = INK, size = 7.2, family = FONT),
+      plot.title = element_blank(), plot.subtitle = element_blank(),
+      plot.margin = margin(1, 8, 7, 1),
+      legend.position = "bottom", legend.direction = "horizontal",
+      legend.title = element_text(colour = INK, size = 7.2, family = FONT),
+      legend.text  = element_text(colour = INK2, size = 6.0, family = FONT),
+      legend.key.width = unit(8, "pt"), legend.key.height = unit(5, "pt"),
+      legend.margin = margin(t = -1, b = 0), legend.box.spacing = unit(2, "pt"),
+      legend.background = element_blank(), legend.key = element_blank(),
+      plot.background = element_rect(fill = SURFACE, colour = NA))
+}
+theme_set(theme_thesis())
+q <- function(x, p) unname(quantile(x, p))
+```
+
+```{r load}
+bl <- read.csv("results_baselines.csv")
+c(rows = nrow(bl), trials = n_distinct(bl$trial), methods = n_distinct(bl$method))
+```
+
+# Descriptive statistics over the bootstrap trials
+
+```{r descriptives}
+bl %>% mutate(method = factor(method, levels = M)) %>% group_by(method) %>%
+  summarise(across(c(f1_center, p_center, r_center, mae, mape, s_per_image, gpu_delta_mb),
+                   list(mean = mean, sd = sd, median = median)), .groups = "drop") %>%
+  as.data.frame()
+```
+
+# Paired differences
+
+```{r paired}
+w <- bl %>%
+  dplyr::select(trial, method, f1_center, p_center, r_center, mae, mape, s_per_image) %>%
+  pivot_longer(-c(trial, method), names_to = "metric", values_to = "value") %>%
+  pivot_wider(names_from = method, values_from = value)
+
+paired <- bind_rows(lapply(c("grounding_dino", "yolo"), function(m)
+  w %>% group_by(metric) %>%
+    summarise(against = m,
+              diff = mean(proposed - .data[[m]]),
+              lo = q(proposed - .data[[m]], .025),
+              hi = q(proposed - .data[[m]], .975),
+              wins = mean(proposed > .data[[m]]), .groups = "drop"))) %>%
+  mutate(resolved = (lo > 0) | (hi < 0))
+as.data.frame(paired)
+```
+
+# Counting bias
+
+```{r counting-bias}
+bl %>% mutate(method = factor(method, levels = M)) %>% group_by(method) %>%
+  summarise(precision = mean(p_center), recall = mean(r_center),
+            bias_ratio = mean(r_center) / mean(p_center),
+            mae = mean(mae), mape = mean(mape), .groups = "drop")
+```
+
+# Constant-count reference
+
+```{r reference}
+lab <- read.csv("labels_contents.csv")
+plan <- fromJSON("plan_v2.json")
+counts <- table(sub("\\.txt$", "", lab$filename))
+k <- as.integer(median(as.integer(counts)))
+
+floor_on <- function(ids) {
+  n <- as.integer(counts[ids]); n[is.na(n)] <- 0L
+  c(k = k, n = length(n), mae = mean(abs(n - k)), mape = 100 * mean(abs(n - k) / n))
+}
+rbind(test = floor_on(plan$test_set), evaluation = floor_on(plan$eval_set))
+```
+
+# Cost
+
+```{r cost}
+bl %>% mutate(method = factor(method, levels = M)) %>% group_by(method) %>%
+  summarise(time_median = median(s_per_image), time_mean = mean(s_per_image),
+            gpu_delta_mb = first(gpu_delta_mb), .groups = "drop") %>%
+  mutate(speedup_vs_proposed = time_median / time_median[method == "proposed"],
+         gpu_ratio_vs_proposed = gpu_delta_mb / gpu_delta_mb[method == "proposed"])
+```
+
+# Figures
+
+```{r fig-distributions, fig.width=5.9, fig.height=2.3}
+bl$method <- factor(bl$method, levels = rev(M))
+
+den <- bind_rows(
+  data.frame(metric = "F1",  method = bl$method, value = bl$f1_center),
+  data.frame(metric = "MAE", method = bl$method, value = bl$mae))
+den$metric <- factor(den$metric, levels = c("F1", "MAE"))
+p <- ggplot(den, aes(value, fill = method, colour = method)) +
+  geom_density(alpha = 0.30, linewidth = 0.6 / .pt) +
+  facet_wrap(~metric, scales = "free", nrow = 1) +
+  scale_fill_manual(values = MCOL, labels = MLAB, name = NULL, breaks = M) +
+  scale_colour_manual(values = MCOL, labels = MLAB, name = NULL, breaks = M) +
+  labs(x = NULL, y = NULL) + theme_thesis() +
+  theme(axis.text.x = element_text(colour = INK2, size = 7, family = FONT),
+        axis.text.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        strip.text = element_text(colour = INK, size = 8, family = FONT),
+        legend.text = element_text(colour = INK2, size = 7, family = FONT))
+print(p)
+ggsave("figures/base_distributions.pdf", p, width = 5.9, height = 2.3, device = "pdf", family = FONT)
+```
+
+```{r fig-boxplots, fig.width=5.9, fig.height=3.6}
+bx <- bind_rows(
+  data.frame(metric = "F1",        method = bl$method, value = bl$f1_center),
+  data.frame(metric = "Precision", method = bl$method, value = bl$p_center),
+  data.frame(metric = "Recall",    method = bl$method, value = bl$r_center),
+  data.frame(metric = "MAE",       method = bl$method, value = bl$mae))
+bx$metric <- factor(bx$metric, levels = c("F1", "Precision", "Recall", "MAE"))
+bx$method <- factor(as.character(bx$method), levels = M)
+# Whiskers are the 2.5th and 97.5th percentiles, so the span they draw is the
+# same 95% percentile interval the text quotes.
+five <- function(x) {
+  qq <- quantile(x, c(.025, .25, .5, .75, .975))
+  data.frame(ymin = qq[[1]], lower = qq[[2]], middle = qq[[3]],
+             upper = qq[[4]], ymax = qq[[5]])
+}
+p <- ggplot(bx, aes(method, value, fill = method, colour = method)) +
+  stat_summary(fun.data = five, geom = "boxplot", width = 0.55,
+               linewidth = 0.6 / .pt, alpha = 0.30) +
+  facet_wrap(~metric, scales = "free_y", nrow = 2) +
+  scale_fill_manual(values = MCOL, guide = "none") +
+  scale_colour_manual(values = MCOL, guide = "none") +
+  scale_x_discrete(labels = MLAB) +
+  labs(x = NULL, y = NULL) + theme_thesis() +
+  theme(axis.text.x = element_text(colour = INK2, size = 7, family = FONT,
+                                   angle = 18, hjust = 1),
+        axis.text.y = element_text(colour = INK2, size = 7, family = FONT),
+        strip.text = element_text(colour = INK, size = 8, family = FONT))
+print(p)
+ggsave("figures/base_boxplots.pdf", p, width = 5.9, height = 3.6, device = "pdf", family = FONT)
+```
+
+```{r fig-paired, fig.width=5.9, fig.height=2.2}
+pr <- bl[bl$method == "proposed", ][order(bl$trial[bl$method == "proposed"]), ]
+pd <- bind_rows(lapply(c("grounding_dino", "yolo"), function(b) {
+  bb <- bl[bl$method == b, ][order(bl$trial[bl$method == b]), ]
+  bind_rows(lapply(names(c(F1 = "f1_center", MAE = "mae")), function(nm) {
+    cl <- c(F1 = "f1_center", MAE = "mae")[[nm]]
+    data.frame(against = MLAB[[b]], metric = nm, diff = pr[[cl]] - bb[[cl]])
+  }))
+}))
+pd$metric <- factor(pd$metric, levels = c("F1", "MAE"))
+pd$against <- factor(pd$against, levels = MLAB[c("yolo", "grounding_dino")])
+p <- ggplot(pd, aes(diff, against, fill = against)) +
+  geom_vline(xintercept = 0, colour = ACCENT, linewidth = 0.6 / .pt, linetype = "22") +
+  geom_violin(colour = MUTED, linewidth = 0.5 / .pt, width = 0.8) +
+  scale_fill_manual(values = setNames(MCOL[c("yolo", "grounding_dino")],
+                                      MLAB[c("yolo", "grounding_dino")]),
+                    guide = "none") +
+  stat_summary(fun = mean, geom = "point", size = 1.4, colour = INK) +
+  facet_wrap(~metric, scales = "free_x") +
+  labs(x = "paired difference (proposed minus baseline)", y = NULL) +
+  theme_thesis() +
+  theme(axis.text = element_text(colour = INK2, size = 7, family = FONT),
+        axis.title.x = element_text(colour = INK, size = 8, family = FONT),
+        strip.text = element_text(colour = INK, size = 8, family = FONT))
+print(p)
+ggsave("figures/base_paired_differences.pdf", p, width = 5.9, height = 2.2, device = "pdf", family = FONT)
+```
+
+```{r fig-precision-recall, fig.width=4.6, fig.height=3.0}
+p <- ggplot(bl, aes(r_center, p_center, colour = method)) +
+  geom_point(size = 0.45, alpha = 0.10) +
+  geom_point(data = bl %>% group_by(method) %>%
+               summarise(r_center = mean(r_center), p_center = mean(p_center),
+                         .groups = "drop"),
+             shape = 21, size = 1.8, stroke = 0.5, colour = INK, fill = NA) +
+  scale_colour_manual(values = MCOL, labels = MLAB, name = NULL, breaks = M,
+                      guide = guide_legend(override.aes = list(size = 1.6, alpha = 1))) +
+  labs(x = "Recall", y = "Precision") + theme_thesis() +
+  theme(axis.text = element_text(colour = INK2, size = 7, family = FONT),
+        axis.title = element_text(colour = INK, size = 8, family = FONT),
+        legend.text = element_text(colour = INK2, size = 7, family = FONT))
+print(p)
+ggsave("figures/base_precision_recall.pdf", p, width = 4.6, height = 3.0, device = "pdf", family = FONT)
+```
+
+```{r session}
+sessionInfo()
+```

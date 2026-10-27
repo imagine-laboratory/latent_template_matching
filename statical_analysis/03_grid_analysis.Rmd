@@ -1,0 +1,664 @@
+---
+title: "Factorial experiment"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(patchwork)
+  library(ggrepel); library(ARTool); library(car); library(MASS)
+  library(FSA); library(rcompanion)
+})
+# MASS masks dplyr::select and dplyr::filter; pin them back.
+select <- dplyr::select; filter <- dplyr::filter
+set.seed(42)
+```
+
+```{r constants}
+INK    <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"
+GRID_C <- "#e1e0d9"; SURFACE <- "#ffffff"
+ACCENT <- "#c1121f"
+# The one neutral ramp of the thesis: constant hue and chroma, five rungs.
+WARM   <- c("#aaa8a2", "#888680", "#65635d", "#46443f", "#292823")
+FONT   <- "URWPalladio"
+FIGDIR <- "figures"; dir.create(FIGDIR, showWarnings = FALSE)
+FIG_W  <- 5.9; FIG_H <- 3.4
+
+ALPHA     <- 0.05
+FACTORS   <- c("roi_size", "max_crops", "mode", "thresh", "pool_ks")
+RESPONSES <- c("F1", "MAE")
+BLOCK     <- "replica"
+RESP_LABELS <- c(F1 = "F1-score", MAE = "MAE")
+BLUE <- "#2a78d6"; ORANGE <- "#eb6834"; VIOLET <- "#4a3aa7"; YELLOW <- "#eda100"
+RESP_COLORS <- c(F1 = BLUE, MAE = ORANGE)
+MODE_COLORS <- c(average = VIOLET, majority_voting = YELLOW)
+SLATE <- c("#9aa6b4", "#7d8998", "#626d7c", "#46505d", "#2a313b")
+SELECTED <- list(roi_size = 9, max_crops = 90, mode = "average",
+                 thresh = 0.58, pool_ks = 9)
+
+theme_thesis <- function(base = 8.5) {
+  theme_minimal(base_size = base, base_family = FONT) +
+    theme(
+      text = element_text(colour = INK, family = FONT),
+      panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(colour = GRID_C, linewidth = 0.5 / .pt),
+      panel.border = element_blank(),
+      axis.line  = element_line(colour = MUTED, linewidth = 0.6 / .pt),
+      axis.ticks = element_line(colour = INK2,  linewidth = 0.6 / .pt),
+      axis.ticks.length = unit(1.5, "pt"),
+      axis.text  = element_text(colour = INK2, size = 6.3, family = FONT),
+      axis.title = element_text(colour = INK, size = 7.2, family = FONT),
+      strip.text = element_text(colour = INK, size = 7.2, family = FONT),
+      plot.title = element_blank(), plot.subtitle = element_blank(),
+      plot.margin = margin(1, 8, 7, 1),
+      legend.position = "bottom", legend.direction = "horizontal",
+      legend.title = element_text(colour = INK, size = 7.2, family = FONT),
+      legend.text  = element_text(colour = INK2, size = 6.0, family = FONT),
+      legend.key.width = unit(8, "pt"), legend.key.height = unit(5, "pt"),
+      legend.margin = margin(t = -1, b = 0), legend.box.spacing = unit(2, "pt"),
+      legend.background = element_blank(), legend.key = element_blank(),
+      plot.background = element_rect(fill = SURFACE, colour = NA))
+}
+theme_set(theme_thesis())
+save_fig <- function(p, name, w = FIG_W, h = FIG_H)
+  ggsave(file.path(FIGDIR, paste0(name, ".pdf")), p, width = w, height = h,
+         device = "pdf", family = FONT)
+```
+
+```{r load}
+raw <- read.csv("grid_results.csv", stringsAsFactors = FALSE)
+df <- raw %>%
+  rename(F1 = f1_center, MAE = mae,
+         precision_point = p_center, recall_point = r_center,
+         F1_iou = f1, precision_iou = precision, recall_iou = recall) %>%
+  mutate(across(all_of(c(FACTORS, BLOCK)), factor))
+c(rows = nrow(df), configs = nrow(distinct(df[FACTORS])), replicas = nlevels(df[[BLOCK]]))
+```
+
+```{r level-keys}
+KEYSEP  <- "\u001f"
+LEV_ALL <- unlist(lapply(FACTORS, function(f)
+  paste(f, levels(df[[f]]), sep = KEYSEP)))
+
+lev_key <- function(fac, lev) factor(paste(fac, lev, sep = KEYSEP), levels = LEV_ALL)
+# The `mode` panel is the narrowest and carries the longest label, so the key is
+# stripped and the underscore becomes a line break: "majority_voting" would
+# otherwise run into "average".
+scale_x_levels <- function()
+  ggplot2::scale_x_discrete(labels = function(x)
+    sub("_", "_\n", sub(paste0(".*", KEYSEP), "", x)))
+# On a horizontal layout the labels have the full width of the margin, so they
+# need no break.
+# `limits = rev` makes the levels read downwards in the same order as the rows
+# of the thesis tables; a discrete y axis would otherwise start at the bottom.
+scale_y_levels <- function()
+  ggplot2::scale_y_discrete(limits = rev,
+                            labels = function(x) sub(paste0(".*", KEYSEP), "", x))
+```
+
+# Descriptive statistics
+
+```{r desc-factor}
+by_factor <- lapply(FACTORS, function(f)
+  df %>% group_by(level = .data[[f]]) %>%
+    summarise(n = n(), F1_mean = mean(F1), F1_sd = sd(F1),
+              MAE_mean = mean(MAE), MAE_sd = sd(MAE), .groups = "drop") %>%
+    mutate(factor = f, .before = 1))
+desc_factor <- bind_rows(by_factor)
+desc_factor
+```
+
+```{r fig-box, fig.width=FIG_W, fig.height=FIG_H}
+long <- df %>%
+  select(all_of(c(FACTORS, RESPONSES))) %>%
+  pivot_longer(all_of(FACTORS), names_to = "factor", values_to = "level") %>%
+  pivot_longer(all_of(RESPONSES), names_to = "response", values_to = "value") %>%
+  mutate(level = lev_key(factor, level),
+         factor = base::factor(factor, levels = FACTORS))
+
+for (r in RESPONSES) {
+  p <- ggplot(filter(long, response == r), aes(level, value)) +
+    geom_boxplot(outlier.size = 0.4, outlier.colour = MUTED,
+                 fill = MUTED, alpha = 0.25,
+                 colour = MUTED, linewidth = 0.6 / .pt, width = 0.6) +
+    facet_wrap(~factor, scales = "free_x", nrow = 1) +
+    scale_x_levels() +
+    labs(x = NULL, y = RESP_LABELS[[r]])
+  print(p); save_fig(p, paste0("grid_boxplots_", r), w = 6.9, h = 2.6)
+}
+```
+
+# Assumption verification
+
+```{r assumptions}
+cellres <- df %>% group_by(across(all_of(FACTORS))) %>%
+  mutate(across(all_of(RESPONSES), ~ .x - mean(.x), .names = "res_{.col}")) %>% ungroup()
+
+# Population skewness and excess kurtosis, reported beside the test: they say
+# how the residuals depart from normal, which W alone does not.
+skew <- function(x) { m <- mean(x); n <- length(x)
+  sum((x - m)^3) / n / (sum((x - m)^2) / n)^1.5 }
+exkurt <- function(x) { m <- mean(x); n <- length(x)
+  sum((x - m)^4) / n / (sum((x - m)^2) / n)^2 - 3 }
+norm_rows <- lapply(RESPONSES, function(r) {
+  x <- cellres[[paste0("res_", r)]]
+  w <- shapiro.test(x)
+  data.frame(response = r, W = unname(w$statistic), p = w$p.value,
+             skew = skew(x), exkurt = exkurt(x))
+})
+normality <- bind_rows(norm_rows)
+
+lev_rows <- list()
+for (r in RESPONSES) for (f in FACTORS) {
+  lt <- car::leveneTest(df[[r]] ~ df[[f]], center = median)
+  lev_rows[[paste(r, f)]] <- data.frame(response = r, factor = f,
+                                        F = lt[1, "F value"], p = lt[1, "Pr(>F)"])
+}
+levene <- bind_rows(lev_rows)
+# Persisted so the thesis table is formatted from the same numbers rather than
+# recomputed: SciPy's shapiro underflows to p = 0 where R reports 1.4e-46.
+knitr::kable(normality, digits = 4, caption = "Shapiro-Wilk on within-cell residuals")
+knitr::kable(levene, digits = 4, caption = "Levene (Brown-Forsythe) per factor")
+```
+
+```{r fig-normality, fig.width=FIG_W, fig.height=5.0}
+resid_long <- bind_rows(lapply(RESPONSES, function(r)
+  data.frame(response = r, value = cellres[[paste0("res_", r)]])))
+# A normal density with the residuals' own standard deviation, to compare shape
+# rather than scale.
+norm_curve <- bind_rows(lapply(RESPONSES, function(r) {
+  x <- cellres[[paste0("res_", r)]]
+  g <- seq(min(x), max(x), length.out = 400)
+  data.frame(response = r, value = g, dens = dnorm(g, 0, sd(x)))
+}))
+p_dist <- ggplot(resid_long, aes(value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 60,
+                 fill = MUTED, alpha = 0.40, colour = NA) +
+  geom_line(data = norm_curve, aes(value, dens),
+            colour = ACCENT, linewidth = 0.7 / .pt, linetype = "32") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(x = "Within-cell residual", y = "Density")
+
+qq <- bind_rows(lapply(RESPONSES, function(r) {
+  x <- cellres[[paste0("res_", r)]]
+  data.frame(response = r, theo = qqnorm(x, plot.it = FALSE)$x,
+             samp = qqnorm(x, plot.it = FALSE)$y)
+}))
+# The reference line goes through the first and third quartiles, as a Q-Q line
+# must: the residuals keep their own units, so an identity line would be drawn
+# at slope 1 against quantiles that run from -3 to 3 and come out near vertical.
+qline <- bind_rows(lapply(RESPONSES, function(r) {
+  x  <- cellres[[paste0("res_", r)]]
+  qs <- quantile(x, c(.25, .75)); ts <- qnorm(c(.25, .75))
+  sl <- unname(diff(qs) / diff(ts))
+  data.frame(response = r, slope = sl, intercept = unname(qs[1]) - sl * ts[1])
+}))
+p_qq <- ggplot(qq, aes(theo, samp)) +
+  geom_point(size = 0.3, alpha = 0.25, colour = MUTED) +
+  geom_abline(data = qline, aes(slope = slope, intercept = intercept),
+              colour = ACCENT, linewidth = 0.7 / .pt, linetype = "32") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(x = "Theoretical quantiles", y = "Within-cell residual")
+
+# One figure rather than two stacked by LaTeX: patchwork aligns the panels, so
+# the four plot areas share their left edge.  Two separately saved PDFs cannot,
+# because each sizes its own margin from the width of its own axis labels.
+p <- p_dist / p_qq
+print(p); save_fig(p, "grid_normality_diagnostics", h = 5.0)
+```
+
+```{r fig-variance, fig.width=FIG_W, fig.height=2.5}
+# Residual against the cell mean that produced it: the fitted value of the
+# saturated model.  Equal variances would show a band of constant width.
+sl <- bind_rows(lapply(RESPONSES, function(r) data.frame(
+  response = r,
+  fitted = cellres[[r]] - cellres[[paste0("res_", r)]],
+  resid  = cellres[[paste0("res_", r)]])))
+p <- ggplot(sl, aes(fitted, resid)) +
+  geom_point(size = 0.3, alpha = 0.25, colour = MUTED) +
+  geom_hline(yintercept = 0, colour = ACCENT, linewidth = 0.7 / .pt, linetype = "32") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(x = "Cell mean (fitted value)", y = "Within-cell residual")
+print(p); save_fig(p, "grid_variance_diagnostics", h = 2.5)
+```
+
+```{r transformations}
+cell_resid <- function(y, d) y - ave(y, interaction(d[FACTORS], drop = TRUE))
+bc_fit <- function(y, d) {
+  form <- as.formula(paste("y ~", paste(FACTORS, collapse = " * ")))
+  bc <- MASS::boxcox(form, data = cbind(d, y = y), plotit = FALSE,
+                     lambda = seq(-3, 3, 0.005))
+  keep <- bc$x[bc$y > max(bc$y) - qchisq(.95, 1) / 2]
+  list(lambda = bc$x[which.max(bc$y)], lo = min(keep), hi = max(keep))
+}
+bc <- setNames(lapply(RESPONSES, function(r) bc_fit(df[[r]], df)), RESPONSES)
+boxcox_tf <- function(y, l) if (abs(l) < 1e-8) log(y) else (y^l - 1) / l
+scales_for <- function(r) { l <- bc[[r]]$lambda
+  list(identity = function(y) y, sqrt = sqrt, cbrt = function(y) y^(1/3),
+       log = log, `1/x` = function(y) 1 / y,
+       `box-cox` = function(y) boxcox_tf(y, l)) }
+
+transformations <- bind_rows(lapply(RESPONSES, function(r) {
+  y0 <- df[[r]]
+  bind_rows(lapply(names(scales_for(r)), function(nm) {
+    z <- scales_for(r)[[nm]](y0); e <- cell_resid(z, df)
+    sw <- shapiro.test(e)
+    rej <- sum(sapply(FACTORS, function(f)
+      leveneTest(z ~ df[[f]], center = median)$`Pr(>F)`[1] < ALPHA))
+    sdr <- max(sapply(FACTORS, function(f) {
+      m <- tapply(z, df[[f]], sd); max(m) / min(m) }))
+    data.frame(response = r, transform = nm,
+               lambda = if (nm == "box-cox") bc[[r]]$lambda else NA_real_,
+               W = unname(sw$statistic), p_shapiro = sw$p.value,
+               levene_rejects = rej, sd_ratio_max = sdr,
+               both_hold = sw$p.value > ALPHA && rej == 0)
+  }))
+}))
+transformations
+```
+
+# The factorial ART model
+
+```{r art-fit}
+fit_art <- function(resp)
+  art(as.formula(sprintf("%s ~ %s + Error(%s)", resp,
+                         paste(FACTORS, collapse = " * "), BLOCK)), data = df)
+fits <- setNames(lapply(RESPONSES, function(r) list(model = fit_art(r))), RESPONSES)
+```
+
+```{r art-effects, cache=TRUE, cache.lazy=FALSE}
+SS_TYPE <- "III"   # ARTool's default; pinned rather than inherited
+
+effect_table <- function(resp, type = SS_TYPE) {
+  a  <- as.data.frame(anova(fits[[resp]]$model, type = type))
+  Fv <- if ("F value" %in% names(a)) a[["F value"]] else a[["F"]]
+  dr <- if ("Df.res"  %in% names(a)) a$Df.res       else a[["Den Df"]]
+  tm <- if ("Term"    %in% names(a)) as.character(a$Term) else rownames(a)
+  data.frame(response = resp, effect = tm,
+             order = lengths(strsplit(tm, ":")), df = a$Df, df_res = dr,
+             F = Fv, p = a[["Pr(>F)"]],
+             eta_p2 = Fv * a$Df / (Fv * a$Df + dr), stringsAsFactors = FALSE)
+}
+eff <- bind_rows(lapply(RESPONSES, effect_table))
+for (r in RESPONSES) {
+  k <- sum(eff$response == r)
+  if (k != 31) warning(sprintf("%s: %d effects, expected 31", r, k))
+}
+
+# Types I, II and III must coincide here; confirm rather than assert.
+for (r in RESPONSES) {
+  g <- function(ty) effect_table(r, ty)$eta_p2
+  cat(sprintf("%s: max |III-II| = %.3g, max |III-I| = %.3g\n",
+              r, max(abs(g("III") - g("II"))), max(abs(g("III") - g("I")))))
+}
+```
+
+```{r art-print}
+for (r in RESPONSES) {
+  e <- eff[eff$response == r, ]
+  cat("\n=====", r, "=====\n")
+  print(e[order(e$order, -e$eta_p2), c("effect", "order", "df", "p", "eta_p2")],
+        row.names = FALSE, digits = 4)
+}
+```
+
+```{r main-order}
+main <- eff %>% filter(order == 1) %>% arrange(response, desc(eta_p2))
+knitr::kable(main[, c("response", "effect", "df", "F", "p", "eta_p2")], digits = 4)
+ord <- sapply(RESPONSES, function(r) {
+  m <- main[main$response == r, ]
+  paste(sprintf("%s (%.3f)", m$effect, m$eta_p2), collapse = " > ")
+})
+```
+
+```{r inter}
+big <- eff %>% filter(eta_p2 >= 0.30) %>% arrange(response, desc(eta_p2))
+knitr::kable(big[, c("response", "effect", "order", "df", "p", "eta_p2")], digits = 4,
+             caption = "Effects reaching eta_p^2 >= 0.30 on either response")
+top <- eff[which.max(eff$eta_p2), ]
+```
+
+```{r fig-effects, fig.width=FIG_W, fig.height=4.4}
+# One panel per response, each ordered by its own magnitude: a single panel
+# ordered by the mean of the two shows neither ranking.  The key trick of the
+# level-ordering helpers is reused here to order within a facet.
+# 0.14 is the threshold the thesis table calls large, so the figure and the
+# shading of that table cut at the same place.
+rank_df <- eff %>% filter(eta_p2 >= 0.14) %>%
+  arrange(response, eta_p2) %>%
+  mutate(key = factor(paste(response, effect, sep = KEYSEP),
+                      levels = unique(paste(response, effect, sep = KEYSEP))))
+p <- ggplot(rank_df, aes(eta_p2, key)) +
+  geom_col(fill = MUTED, width = 0.58) +
+  geom_text(aes(label = sprintf("%.3f", eta_p2)), hjust = -0.18,
+            size = 6.4 / .pt, colour = INK2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.13))) +
+  # space = "free_y" gives each panel a height proportional to its own number
+  # of bars: 6 effects are large on F1 against 18 on the MAE.
+  facet_grid(response ~ ., scales = "free_y", space = "free_y", switch = "y",
+             labeller = labeller(response = RESP_LABELS)) +
+  scale_y_discrete(labels = function(x) sub(paste0(".*", KEYSEP), "", x)) +
+  labs(x = NULL, y = NULL) +
+  theme(strip.placement = "outside",
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(colour = GRID_C, linewidth = 0.5 / .pt))
+print(p); save_fig(p, "grid_effect_size_ranking", h = 4.4)
+```
+
+```{r fig-main-effects, fig.width=FIG_W, fig.height=1.75}
+# The five main effects alone, each panel ordered by its own magnitude, as the
+# counterpart of the full ranking above.
+main_df <- eff %>% filter(order == 1) %>%
+  arrange(response, eta_p2) %>%
+  mutate(key = factor(paste(response, effect, sep = KEYSEP),
+                      levels = unique(paste(response, effect, sep = KEYSEP))))
+p <- ggplot(main_df, aes(eta_p2, key)) +
+  geom_col(fill = MUTED, width = 0.5) +
+  geom_text(aes(label = sprintf("%.3f", eta_p2)), hjust = -0.18,
+            size = 6.4 / .pt, colour = INK2) +
+  scale_x_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.13))) +
+  scale_y_discrete(labels = function(x) sub(paste0(".*", KEYSEP), "", x)) +
+  facet_wrap(~response, scales = "free_y", labeller = labeller(response = RESP_LABELS)) +
+  labs(x = NULL, y = NULL) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(colour = GRID_C, linewidth = 0.5 / .pt))
+print(p); save_fig(p, "grid_main_effect_ranking", h = 1.75)
+```
+
+# Post-hoc contrasts
+
+```{r artcon}
+con_rows <- list()
+for (r in RESPONSES) for (f in FACTORS) {
+  cs <- tryCatch({
+    x <- as.data.frame(summary(art.con(fits[[r]]$model, f, adjust = "holm")))
+    x$response <- r; x$factor <- f; x
+  }, error = function(e) { cat("art.con failed for", r, "/", f, ":", conditionMessage(e), "\n"); NULL })
+  if (!is.null(cs)) con_rows[[paste(r, f)]] <- cs
+}
+if (length(con_rows)) {
+  con <- bind_rows(con_rows)
+  knitr::kable(head(con, 25), digits = 4)
+} else cat("no contrasts obtained; art.con() does not support the error structure used above.\n")
+```
+
+# Blocking factor
+
+```{r blocking}
+wide <- df %>% mutate(cfg = interaction(!!!rlang::syms(FACTORS), drop = TRUE))
+fr <- lapply(RESPONSES, function(r) {
+  m <- matrix(wide[[r]][order(wide$cfg, wide$replica)],
+              ncol = nlevels(wide$replica), byrow = TRUE)
+  ft <- friedman.test(m)
+  data.frame(response = r, chi2 = unname(ft$statistic), df = unname(ft$parameter),
+             p = ft$p.value, kendall_W = unname(ft$statistic) / (nrow(m) * (ncol(m) - 1)))
+})
+blocking <- bind_rows(fr)
+knitr::kable(blocking, digits = 4)
+```
+
+```{r fig-replica, fig.width=5.9, fig.height=2.4}
+# single-series figure in the thesis rather than a hue per response.
+rep_m <- df %>% group_by(replica) %>%
+  summarise(across(all_of(RESPONSES), list(mean = mean, sd = sd)), .groups = "drop") %>%
+  tidyr::pivot_longer(-replica, names_to = c("response", "stat"), names_sep = "_") %>%
+  tidyr::pivot_wider(names_from = stat, values_from = value)
+# The run log records the replicas from 0; the thesis numbers them from 1.
+rep_m$label <- paste0("R", as.integer(as.character(rep_m$replica)) + 1)
+p <- ggplot(rep_m, aes(label, mean)) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.12,
+                colour = WARM[1], linewidth = 0.6 / .pt) +
+  geom_point(size = 1.6, colour = MUTED) +
+  facet_wrap(~response, scales = "free_y",
+             labeller = labeller(response = c(F1 = "F1-score", MAE = "MAE"))) +
+  labs(x = "template replica", y = NULL) +
+  theme_thesis() +
+  theme(axis.text = element_text(colour = INK2, size = 7, family = FONT),
+        axis.title.x = element_text(colour = INK, size = 8, family = FONT),
+        strip.text = element_text(colour = INK, size = 8, family = FONT))
+print(p)
+path <- file.path(FIGDIR, "grid_replica_means.pdf")
+ggsave(path, p, width = 5.9, height = 2.4, device = "pdf", family = FONT)
+```
+
+# Kruskal-Wallis and Dunn screening
+
+```{r kruskal}
+kw <- bind_rows(lapply(RESPONSES, function(r) bind_rows(lapply(FACTORS, function(f) {
+  kt <- kruskal.test(df[[r]] ~ df[[f]])
+  data.frame(response = r, factor = f, H = unname(kt$statistic),
+             df = unname(kt$parameter), p = kt$p.value,
+             eps2 = (unname(kt$statistic) - nlevels(df[[f]]) + 1) / (nrow(df) - nlevels(df[[f]])))
+}))))
+
+# The screening is only worth reporting beside the model it screens for, so the
+# ART main-effect size and the ordering each method gives are carried along.
+art_main <- eff %>%
+  filter(effect %in% FACTORS) %>%
+  select(response, factor = effect, art_eta2p = eta_p2, art_p = p)
+kw <- kw %>%
+  left_join(art_main, by = c("response", "factor")) %>%
+  group_by(response) %>%
+  mutate(kw_rank = rank(-eps2), art_rank = rank(-art_eta2p)) %>%
+  ungroup()
+knitr::kable(kw, digits = 4)
+```
+
+```{r dunn}
+dunn_rows <- list()
+for (r in RESPONSES) for (f in FACTORS) {
+  # Dunn's test is a post-hoc for more than two groups; with two levels the
+  # Kruskal-Wallis test above already is the comparison, and FSA errors out.
+  if (nlevels(df[[f]]) < 3) {
+    cat(sprintf("skipping Dunn for %s: only %d levels, Kruskal-Wallis is the comparison\n",
+                f, nlevels(df[[f]])))
+    next
+  }
+  dt <- FSA::dunnTest(df[[r]] ~ df[[f]], method = "holm")$res
+  dt$response <- r; dt$factor <- f
+  dunn_rows[[paste(r, f)]] <- dt
+}
+dunn <- bind_rows(dunn_rows)
+knitr::kable(head(dunn, 20), digits = 4)
+```
+
+# Selecting the operating configuration
+
+```{r config}
+cfg <- df %>% group_by(across(all_of(FACTORS))) %>%
+  summarise(F1 = mean(F1), MAE = mean(MAE), F1_sd = sd(F1), MAE_sd = sd(MAE),
+            .groups = "drop")
+
+is_dominated <- function(i, d) any(d$F1 >= d$F1[i] & d$MAE <= d$MAE[i] &
+                                   (d$F1 > d$F1[i] | d$MAE < d$MAE[i]))
+cfg$pareto <- !sapply(seq_len(nrow(cfg)), is_dominated, d = cfg)
+cfg$selected <- with(cfg, roi_size == SELECTED$roi_size & max_crops == SELECTED$max_crops &
+                       mode == SELECTED$mode & abs(as.numeric(as.character(thresh)) - SELECTED$thresh) < 1e-9 &
+                       pool_ks == SELECTED$pool_ks)
+knitr::kable(head(arrange(cfg, desc(F1)), 8), digits = 4, caption = "Top 8 by F1")
+knitr::kable(head(arrange(cfg, MAE), 8), digits = 4, caption = "Top 8 by MAE")
+```
+
+```{r fig-pareto, fig.width=4.6, fig.height=3.4}
+# point, so a reader can tell which configuration each extreme is without
+# going to the table.  Labelling every point is illegible at this width.
+pareto_fig <- function(dat, lab_rows, name, nudge, w = 4.6, h = 3.4) {
+  front <- dat %>% filter(pareto) %>% arrange(MAE)
+  p <- ggplot(dat, aes(F1, MAE)) +
+    geom_point(colour = WARM[2], alpha = 0.40, size = 0.8) +
+    geom_line(data = front, colour = MUTED, linewidth = 1.3 / .pt) +
+    geom_point(data = front, colour = INK, size = 1.3) +
+    ggrepel::geom_text_repel(data = lab_rows, aes(label = lab),
+                             size = 6.2 / .pt, colour = INK2, family = FONT,
+                             seed = 1, min.segment.length = 0,
+                             segment.size = 0.2, segment.colour = WARM[2],
+                             box.padding = 0.4, point.padding = 0.2,
+                             nudge_y = nudge, direction = "both") +
+    scale_x_continuous(expand = expansion(mult = 0.06)) +
+    labs(x = "F1-score", y = "MAE") + theme_thesis() +
+    theme(axis.text  = element_text(colour = INK2, size = 7, family = FONT),
+          axis.title = element_text(colour = INK, size = 8, family = FONT))
+  if ("selected" %in% names(dat))
+    p <- p + geom_point(data = filter(dat, selected), shape = 21, size = 2.6,
+                        stroke = 0.6, colour = ACCENT, fill = NA)
+  print(p)
+  path <- file.path(FIGDIR, paste0(name, ".pdf"))
+  ggsave(path, p, width = w, height = h, device = "pdf", family = FONT)
+}
+
+lab_of <- function(d) sprintf("roi %s, %s crops, ks %s", d$roi_size, d$max_crops, d$pool_ks)
+
+# the factorial front
+cfg <- df %>% group_by(across(all_of(FACTORS))) %>%
+  summarise(F1 = mean(F1), MAE = mean(MAE), .groups = "drop")
+cfg$pareto <- !sapply(seq_len(nrow(cfg)), function(i)
+  any(cfg$F1 >= cfg$F1[i] & cfg$MAE <= cfg$MAE[i] &
+      (cfg$F1 > cfg$F1[i] | cfg$MAE < cfg$MAE[i])))
+cfg$selected <- cfg$roi_size == 9 & cfg$max_crops == 90 & cfg$mode == "average" &
+  abs(as.numeric(as.character(cfg$thresh)) - 0.58) < 1e-9 & cfg$pool_ks == 9
+fr <- filter(cfg, pareto)
+labs <- fr[fr$F1 == max(fr$F1) | fr$MAE == min(fr$MAE) | fr$selected, ]
+labs$lab <- ifelse(labs$selected, paste0(lab_of(labs), "\n(selected)"), lab_of(labs))
+pareto_fig(cfg, labs, "grid_pareto_front", nudge = 5)
+
+# the pooled Optuna trials
+oks <- bind_rows(lapply(c("optuna1_results.csv", "optuna2_results.csv"), read.csv)) %>%
+  transmute(roi_size, max_crops, pool_ks, F1 = f1_center, MAE = mae) %>%
+  filter(F1 > 0, !is.na(MAE))
+oks$pareto <- !sapply(seq_len(nrow(oks)), function(i)
+  any(oks$F1 >= oks$F1[i] & oks$MAE <= oks$MAE[i] &
+      (oks$F1 > oks$F1[i] | oks$MAE < oks$MAE[i])))
+fo <- filter(oks, pareto)
+labo <- fo[fo$F1 == max(fo$F1) | fo$MAE == min(fo$MAE), ]
+labo$lab <- lab_of(labo)
+pareto_fig(oks, labo, "optuna_scatter_pareto", nudge = 12)
+```
+
+# Marginal means
+
+```{r boot-ci}
+set.seed(42); B_BOOT <- 5000
+boot_ci <- function(x, B = B_BOOT) {
+  m <- replicate(B, mean(sample(x, length(x), replace = TRUE)))
+  c(mean = mean(x), lo = unname(quantile(m, .025)), hi = unname(quantile(m, .975)))
+}
+ci <- bind_rows(lapply(RESPONSES, function(r) bind_rows(lapply(FACTORS, function(fc)
+  df %>% group_by(level = .data[[fc]]) %>%
+    summarise(as.data.frame(t(boot_ci(.data[[r]]))), n = n(), .groups = "drop") %>%
+    mutate(response = r, factor = fc, .before = 1)))))
+ci$level  <- lev_key(ci$factor, ci$level)
+ci$factor <- base::factor(ci$factor, levels = FACTORS)
+knitr::kable(head(ci, 12), digits = 4)
+```
+
+# Interaction figures
+
+```{r fig-interactions, fig.width=8.2, fig.height=5.0}
+eta <- setNames(eff$eta_p2, paste(eff$response, eff$effect))
+
+ramp <- function(fc) WARM[round(seq(1, length(WARM), length.out = nlevels(df[[fc]])))]
+
+PAIRS <- combn(FACTORS, 2, simplify = FALSE)
+PAIRS <- PAIRS[order(-sapply(PAIRS, function(p)
+  eta[[paste("MAE", paste(p, collapse = ":"))]]))]
+
+panel <- function(pr, resp) {
+  a <- pr[1]; b <- pr[2]
+  # The factor with more levels goes on the horizontal axis, so that a curve
+  # is traced by as many points as possible and as few lines as possible have
+  # to be told apart by shade.  This puts mode, with two levels, always in
+  # colour, and holds every panel to four lines or fewer.  Ties keep the order
+  # of the design.
+  if (nlevels(df[[b]]) > nlevels(df[[a]])) { a <- pr[2]; b <- pr[1] }
+  cm <- df %>% group_by(.x = .data[[a]], .tr = .data[[b]]) %>%
+    summarise(value = mean(.data[[resp]]), .groups = "drop")
+  ggplot(cm, aes(.x, value, colour = .tr, group = .tr)) +
+    geom_line(linewidth = 1.3 / .pt) + geom_point(size = 1.1) +
+    scale_colour_manual(values = ramp(b), name = b) +
+    scale_y_continuous(n.breaks = 4) +
+    # The factor name starts where the first key does, not centred over them.
+    guides(colour = guide_legend(nrow = 1, title.position = "top",
+                                 title.hjust = 0, label.position = "right",
+                                 override.aes = list(linewidth = 0.8 / .pt, size = 0.5))) +
+    labs(x = a, y = NULL)
+}
+
+for (r in RESPONSES) {
+  g <- wrap_plots(lapply(PAIRS, panel, resp = r), nrow = 2) +
+    plot_annotation(theme = theme(plot.background =
+                                    element_rect(fill = SURFACE, colour = NA)))
+  path <- file.path("figures", paste0("grid_interactions_", r, ".pdf"))
+  print(g)
+  ggsave(path, g, width = 8.2, height = 5.0, device = "pdf", family = FONT)
+  if (!file.exists(path)) stop("figure was not written: ", path)
+  cat("wrote", path, sprintf("(%.0f kB)\n", file.size(path) / 1024))
+}
+
+```
+
+```{r fig-3way, fig.width=5.9, fig.height=1.6}
+# --- the three-way terms of Section 6.4.5 ---------------------------------
+# Each panel holds one level of the conditioning factor and traces the pair
+# inside it, so the three-way term is the change of the pair from panel to
+# panel.  The four of them share this reading.
+three_way <- function(x, colr, facet, resp, h = 2.4, base = 8.5) {
+  cm <- df %>% group_by(.f = .data[[facet]], .x = .data[[x]], .tr = .data[[colr]]) %>%
+    summarise(value = mean(.data[[resp]]), .groups = "drop")
+  ggplot(cm, aes(.x, value, colour = .tr, group = .tr)) +
+    geom_line(linewidth = 1.0 / .pt) + geom_point(size = 1.0) +
+    facet_wrap(~.f, nrow = 1, labeller = labeller(.f = function(v) paste0(facet, ": ", v))) +
+    scale_colour_manual(values = ramp(colr), name = NULL) +
+    labs(x = x, y = NULL) +
+    theme_thesis(base) +
+    theme(legend.position = "top", legend.title = element_blank(),
+          legend.text = element_text(colour = INK2, size = 7, family = FONT),
+          axis.text = element_text(colour = INK2, size = 6.5, family = FONT),
+          axis.title.x = element_text(colour = INK, size = 7.5, family = FONT),
+          strip.text = element_text(colour = INK, size = 7.5, family = FONT))
+}
+
+# Ordered as Section 6.4.5 discusses them, by magnitude on the MAE.
+for (sp in list(
+  list(f = "grid_interaction_3way_crops_mode_thresh", x = "max_crops", c = "mode",  fa = "thresh"),
+  list(f = "grid_interaction_3way_crops_mode_ks", x = "max_crops", c = "mode",      fa = "pool_ks"),
+  list(f = "grid_interaction_3way_mode_thresh_ks", x = "thresh",   c = "mode",      fa = "pool_ks"),
+  list(f = "grid_interaction_3way_crops_thresh_ks", x = "thresh",  c = "max_crops", fa = "pool_ks"))) {
+  p <- three_way(sp$x, sp$c, sp$fa, "MAE")
+  path <- file.path("figures", paste0(sp$f, ".pdf"))
+  print(p)
+  ggsave(path, p, width = 5.9, height = 1.60, device = "pdf", family = FONT)
+  if (!file.exists(path)) stop("figure was not written: ", path)
+  cat("wrote", path, sprintf("(%.0f kB)\n", file.size(path) / 1024))
+}
+
+```
+
+# Cost
+
+```{r cost-inventory}
+COST <- c("elapsed_s", "infer_s", "gpu_alloc_mb", "gpu_reserved_mb", "host_peak_mb")
+cost_tab <- bind_rows(lapply(COST, function(c) data.frame(
+  column = c, min = min(df[[c]]), median = median(df[[c]]), max = max(df[[c]]),
+  sd = sd(df[[c]]), distinct = length(unique(df[[c]])))))
+knitr::kable(cost_tab, digits = 2)
+const <- cost_tab$column[cost_tab$distinct == 1]
+```
+
+```{r fig-cost-factors, fig.width=6.9, fig.height=2.6}
+cost_ci <- bind_rows(lapply(FACTORS, function(fc)
+  df %>% group_by(level = .data[[fc]]) %>%
+    summarise(as.data.frame(t(boot_ci(infer_s))), .groups = "drop") %>%
+    mutate(factor = fc, .before = 1)))
+p <- ggplot(cost_ci, aes(level, mean, group = 1)) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12, colour = INK2, linewidth = 0.6 / .pt) +
+  geom_line(colour = INK2, linewidth = 1.3 / .pt) + geom_point(colour = INK2, size = 1.5) +
+  facet_wrap(~factor, scales = "free_x", nrow = 1) +
+  labs(x = NULL, y = "Inference time per run (s)")
+print(p); save_fig(p, "grid_cost_by_factor", w = 6.9, h = 2.6)
+```
+
+```{r session}
+sessionInfo()
+```
+
